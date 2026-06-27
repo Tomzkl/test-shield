@@ -41,7 +41,18 @@ git diff HEAD
 
 对于每个改动的函数/方法，找到所有调用方：
 
-**方法 A（优先）：** 运行 `python /d/test-shield/scripts/analyze.py <project_root>`
+**方法 A（优先）：** 先定位 analyze.py 脚本路径：
+
+```bash
+# 标准安装路径
+ANALYZER="$HOME/.claude/skills/test-shield/scripts/analyze.py"
+# 如果找不到，搜索
+if [ ! -f "$ANALYZER" ]; then
+  ANALYZER=$(find / -path "*/test-shield/scripts/analyze.py" -type f 2>/dev/null | head -1)
+fi
+python "$ANALYZER" <project_root>
+```
+
 脚本会输出 JSON，包含：
 - `changed_functions`: 改动的函数列表（文件 + 行号 + 函数名）
 - `affected_callers`: 调用方列表（调用方文件 + 行号 + 函数名 + 被调函数）

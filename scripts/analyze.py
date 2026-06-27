@@ -256,6 +256,26 @@ def check_has_tests(project_root: Path, function_name: str) -> bool:
     return False
 
 
+def build_import_alias_map(tree: ast.AST) -> Dict[str, str]:
+    """构建 import 别名映射表。
+
+    解析 AST 中的 import 语句，将别名映射回原始函数名。
+    例如: `from chess_utils import is_checkmate as check_mate`
+    返回: {"check_mate": "is_checkmate"}
+    """
+    alias_map = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.asname:
+                    alias_map[alias.asname] = alias.name
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    alias_map[alias.asname] = alias.name
+    return alias_map
+
+
 def build_call_graph(
     project_root: Path, changed_functions: List[Dict]
 ) -> List[Dict]:
@@ -274,6 +294,9 @@ def build_call_graph(
         except (SyntaxError, UnicodeDecodeError):
             continue
 
+        # 构建当前文件的 import 别名映射
+        alias_map = build_import_alias_map(tree)
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -288,7 +311,9 @@ def build_call_graph(
                 continue
 
             for changed in changed_functions:
-                if callee_name != changed["name"]:
+                # 匹配：直接函数名 或 import 别名
+                resolved_name = alias_map.get(callee_name, callee_name)
+                if resolved_name != changed["name"]:
                     continue
 
                 caller_func = find_enclosing_function(tree, node.lineno)
