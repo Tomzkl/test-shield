@@ -64,13 +64,15 @@ def run_git_diff(project_root: Path) -> str:
     try:
         unstaged = subprocess.run(
             ["git", "diff"],
-            capture_output=True, text=True, cwd=project_root
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", cwd=project_root
         )
         if unstaged.stdout:
             result += unstaged.stdout
         staged = subprocess.run(
             ["git", "diff", "--cached"],
-            capture_output=True, text=True, cwd=project_root
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", cwd=project_root
         )
         if staged.stdout:
             if result:
