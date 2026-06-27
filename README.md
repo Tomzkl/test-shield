@@ -62,10 +62,10 @@ Existing test coverage tools tell you *which lines ran*. They don't tell you *wh
 
 ```bash
 # Clone to your Claude Code skills directory
-git clone https://github.com/dominicharmon/test-shield.git ~/.claude/skills/test-shield
+git clone https://github.com/dominicharmon-commits/test-shield.git ~/.claude/skills/test-shield
 
 # Or via Claude Code marketplace (coming soon)
-# claude plugin marketplace add dominicharmon/test-shield
+# claude plugin marketplace add dominicharmon-commits/test-shield
 ```
 
 ### Usage
