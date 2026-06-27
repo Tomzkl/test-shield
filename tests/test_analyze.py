@@ -76,9 +76,9 @@ class TestParseDiffFiles:
 
 
 class TestIsLowRisk:
-    def test_logger_calls_are_low_risk(self):
-        assert analyze.is_low_risk("logger.info", "src/foo.py") is True
-        assert analyze.is_low_risk("log.error", "src/foo.py") is True
+    def test_logger_dir_is_low_risk(self):
+        assert analyze.is_low_risk("any_func", "src/logging/output.py") is True
+        assert analyze.is_low_risk("any_func", "src/log/handler.py") is True
 
     def test_assert_methods_are_low_risk(self):
         assert analyze.is_low_risk("assertEqual", "tests/test_foo.py") is True
@@ -222,7 +222,10 @@ class TestEndToEnd:
             project = Path(tmpdir)
 
             # 初始化 git
-            os.system(f"cd {project} && git init -q && git config user.email 'test@test.com' && git config user.name 'test'")
+            import subprocess as sp
+            sp.run(["git", "init", "-q"], cwd=project, capture_output=True)
+            sp.run(["git", "config", "user.email", "test@test.com"], cwd=project, capture_output=True)
+            sp.run(["git", "config", "user.name", "test"], cwd=project, capture_output=True)
 
             # 创建被调用的模块
             lib_dir = project / "lib"
@@ -247,7 +250,8 @@ class TestEndToEnd:
                 """), encoding="utf-8")
 
             # 初始提交
-            os.system(f"cd {project} && git add -A && git commit -q -m 'init'")
+            sp.run(["git", "add", "-A"], cwd=project, capture_output=True)
+            sp.run(["git", "commit", "-q", "-m", "init"], cwd=project, capture_output=True)
 
             # 改动：修改 calculate_discount 函数
             (lib_dir / "core.py").write_text(textwrap.dedent("""\
@@ -260,8 +264,7 @@ class TestEndToEnd:
                 """), encoding="utf-8")
 
             # 运行 analyze.py
-            import subprocess
-            result = subprocess.run(
+            result = sp.run(
                 [sys.executable, str(Path(__file__).parent.parent / "scripts" / "analyze.py"), str(project)],
                 capture_output=True, text=True, encoding="utf-8"
             )
