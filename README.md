@@ -4,6 +4,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-28%2F28%20passed-brightgreen)](https://github.com/dominicharmon-commits/test-shield/tree/master/tests)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-skill-8A2BE2)](https://claude.com/claude-code)
+[![Stars](https://img.shields.io/github/stars/dominicharmon-commits/test-shield?style=social)](https://github.com/dominicharmon-commits/test-shield)
 
 A [Claude Code](https://claude.com/claude-code) skill that finds every call site affected by your code changes and generates targeted regression tests — **before** you break production.
 
