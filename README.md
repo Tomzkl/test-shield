@@ -7,6 +7,8 @@
 
 A [Claude Code](https://claude.com/claude-code) skill that finds every call site affected by your code changes and generates targeted regression tests — **before** you break production.
 
+> 📖 [Read the story behind it on dev.to](https://dev.to/dominic_harmon_18363706c7/i-built-a-claude-code-skill-that-finds-broken-callers-before-you-deploy-52a2)
+
 <p align="center">
   <img src="examples/demo.gif" width="700" alt="Test Shield Demo">
 </p>
