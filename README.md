@@ -7,6 +7,10 @@
 
 A [Claude Code](https://claude.com/claude-code) skill that finds every call site affected by your code changes and generates targeted regression tests — **before** you break production.
 
+<p align="center">
+  <a href="examples/demo.mp4">🎬 Watch 30-second demo</a>
+</p>
+
 ---
 
 ## The Problem
