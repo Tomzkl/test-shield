@@ -68,7 +68,18 @@ git clone https://github.com/dominicharmon-commits/test-shield.git ~/.claude/ski
 # claude plugin marketplace add dominicharmon-commits/test-shield
 ```
 
-### Usage
+### Try Without Claude Code (30 seconds)
+
+```bash
+# Clone and run the analyzer on any Python project
+git clone https://github.com/dominicharmon-commits/test-shield.git
+cd your-python-project
+python ../test-shield/scripts/analyze.py .
+```
+
+You'll see exactly which functions your changes affect — no Claude Code required.
+
+### Usage (with Claude Code)
 
 ```bash
 cd your-python-project
