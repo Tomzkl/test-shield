@@ -683,6 +683,250 @@ def _suggest_inputs(args: List[str], func_name: str) -> List[str]:
     return suggestions
 
 
+# === v3.0: 跨仓库 · 热力图 · 匿名模式 ===
+
+
+def _scan_project(project_root: Path) -> List[Dict]:
+    """项目风险热力图：扫描整个项目的所有 .py 文件，按风险从高到低排名。
+
+    每个文件分析：
+    - git 历史（修改次数、bug 频率）
+    - 调用方密度（项目中多少地方调用这个文件的函数）
+    - 综合风险评分 0-100
+    """
+    file_risks = []
+    all_functions = []
+    file_to_functions: Dict[str, List[str]] = {}
+
+    # 第一步：收集所有函数
+    for py_file in project_root.rglob("*.py"):
+        file_str = str(py_file.relative_to(project_root)).replace("\\", "/")
+        if any(skip in py_file.parts for skip in SKIP_DIRS):
+            continue
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        funcs_in_file = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                funcs_in_file.append(node.name)
+                all_functions.append({
+                    "name": node.name,
+                    "file": file_str,
+                    "line": node.lineno,
+                })
+        if funcs_in_file:
+            file_to_functions[file_str] = funcs_in_file
+
+    # 第二步：计算每个文件的调用方密度
+    func_to_callers: Dict[str, int] = {}
+    for func_info in all_functions:
+        count = 0
+        for py_file in project_root.rglob("*.py"):
+            if any(skip in py_file.parts for skip in SKIP_DIRS):
+                continue
+            try:
+                content = py_file.read_text(encoding="utf-8")
+                if func_info["name"] in content:
+                    count += 1
+            except Exception:
+                pass
+        func_to_callers[func_info["name"]] = max(0, count - 1)  # -1 = 排除自身
+
+    # 第三步：Git 历史风险
+    for file_str, funcs in file_to_functions.items():
+        try:
+            result = subprocess.run(
+                ["git", "log", "--oneline", "--", file_str],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=project_root
+            )
+            total = 0
+            risky = 0
+            if result.returncode == 0 and result.stdout.strip():
+                commits = result.stdout.strip().split("\n")
+                total = len(commits)
+                for c in commits:
+                    for pat in RISKY_COMMIT_PATTERNS:
+                        if pat.search(c):
+                            risky += 1
+                            break
+
+            # 调用方密度评分
+            caller_density = sum(func_to_callers.get(f, 0) for f in funcs)
+            density_score = min(50, caller_density * 3)
+
+            # 历史风险评分
+            history_score = min(50, int((risky / max(total, 1)) * 100 + risky * 5))
+
+            risk_score = density_score + history_score
+            if risk_score >= 70:
+                level = "critical"
+            elif risk_score >= 40:
+                level = "high"
+            elif risk_score >= 20:
+                level = "medium"
+            else:
+                level = "low"
+
+            file_risks.append({
+                "file": file_str,
+                "functions": len(funcs),
+                "caller_density": caller_density,
+                "total_commits": total,
+                "risky_commits": risky,
+                "density_score": density_score,
+                "history_score": history_score,
+                "risk_score": risk_score,
+                "risk_level": level,
+            })
+        except Exception:
+            file_risks.append({
+                "file": file_str,
+                "functions": len(funcs),
+                "risk_score": 0,
+                "risk_level": "error",
+            })
+
+    # 第四步：按风险从高到低排序
+    file_risks.sort(key=lambda x: x["risk_score"], reverse=True)
+    return file_risks
+
+
+def _cross_repo_search(
+    project_root: Path, changed_functions: List[Dict], repo_paths: List[str]
+) -> List[Dict]:
+    """跨仓库追踪：在关联仓库中搜索改动函数的调用方。
+
+    repo_paths: 逗号分隔的仓库路径列表。
+    """
+    cross_callers = []
+    for repo_path_str in repo_paths:
+        repo_path = Path(repo_path_str.strip()).resolve()
+        if not repo_path.is_dir() or not (repo_path / ".git").is_dir():
+            continue
+
+        for py_file in repo_path.rglob("*.py"):
+            file_str = str(py_file.relative_to(repo_path)).replace("\\", "/")
+            if any(skip in py_file.parts for skip in SKIP_DIRS):
+                continue
+
+            try:
+                content = py_file.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            for cf in changed_functions:
+                if cf["name"] in content:
+                    cross_callers.append({
+                        "caller_repo": str(repo_path),
+                        "caller_file": file_str,
+                        "callee_name": cf["name"],
+                        "callee_repo": str(project_root),
+                        "callee_file": cf["file"],
+                    })
+
+    return cross_callers
+
+
+def _export_anonymized_risk(output: dict) -> dict:
+    """导出匿名风险数据：剥离文件和函数名，仅保留模式特征。
+
+    安全：输出不含路径/函数名/仓库信息，可以公开分享。
+    """
+    anonymized = {
+        "version": __version__,
+        "export_time": None,  # 由调用者填充
+        "patterns": {
+            "total_changed_functions": output["stats"]["total_changed_functions"],
+            "total_affected_callers": output["stats"]["total_affected_callers"],
+            "high_risk_untested_ratio": (
+                round(output["stats"]["high_risk_untested_count"] /
+                      max(output["stats"]["total_affected_callers"], 1), 2)
+            ),
+            "minimal_safe_set_ratio": (
+                round(output["stats"]["minimal_safe_set"]["must_test"] /
+                      max(output["stats"]["high_risk_untested_count"], 1), 2)
+            ),
+        },
+        "caller_risk_distribution": {
+            "high_risk": output["stats"]["high_risk_count"],
+            "low_risk": output["stats"]["low_risk_count"],
+        },
+        "tracing_method": output["honesty_report"]["tracing_method"],
+        "dynamic_risks_detected": output["honesty_report"]["dynamic_risks_detected"],
+    }
+
+    if output.get("git_archaeology"):
+        scores = [g["risk_score"] for g in output["git_archaeology"]]
+        anonymized["patterns"]["avg_git_risk_score"] = (
+            round(sum(scores) / len(scores), 1) if scores else 0
+        )
+        anonymized["patterns"]["max_git_risk_score"] = max(scores) if scores else 0
+        anonymized["patterns"]["functions_with_bug_history"] = sum(
+            1 for g in output["git_archaeology"] if g["risky_commits"] > 0
+        )
+
+    return anonymized
+
+
+def _print_heatmap(output: dict) -> None:
+    """打印项目风险热力图（人类可读）。"""
+    heatmap = output["heatmap"]
+    summary = output["summary"]
+
+    print(f"\n  项目风险热力图 — {output['project']}")
+    print(f"  扫描文件: {output['total_files_scanned']} 个 .py 文件")
+    print(f"  Critical: {summary['critical']} | High: {summary['high']} | "
+          f"Medium: {summary['medium']} | Low: {summary['low']}")
+    print(f"\n  {'排名':<5} {'风险':<8} {'文件':<50} {'函数':<6} {'历史'}")
+    print(f"  {'-'*4}  {'-'*7}  {'-'*49}  {'-'*5}  {'-'*10}")
+
+    for i, h in enumerate(heatmap[:20], 1):
+        icon = {70: "!!", 40: "! ", 20: "~ ", 0: "  "}.get(
+            max(k for k in [70, 40, 20, 0] if h["risk_score"] >= k), "  ")
+        hist = f"{h.get('total_commits', 0)}改/{h.get('risky_commits', 0)}bug" if h.get("total_commits") else "N/A"
+        print(
+            f"  {i:<4} {icon} {h['risk_score']:<4}  "
+            f"{h['file']:<49} {h['functions']:<5} {hist}"
+        )
+
+    if len(heatmap) > 20:
+        print(f"  ... 另外 {len(heatmap) - 20} 个文件（用 --help 查看完整输出）")
+
+    # Top 3 建议
+    if heatmap:
+        top = [h for h in heatmap if h["risk_level"] in ("critical", "high")][:3]
+        if top:
+            print(f"\n  --- 优先加固 Top 3 ---")
+            for i, h in enumerate(top[:3], 1):
+                print(f"  {i}. {h['file']} — 为 {h['functions']} 个函数补充回归测试")
+    print()
+
+
+def _export_anonymized_risk_for_scan(output: dict) -> dict:
+    """为 --scan 模式导出的匿名风险数据（不包含文件名）。"""
+    heatmap = output.get("heatmap", [])
+    if not heatmap:
+        return {"mode": "scan", "error": "no data"}
+    scores = [h.get("risk_score", 0) for h in heatmap]
+    return {
+        "mode": "scan",
+        "version": __version__,
+        "total_files": len(heatmap),
+        "risk_distribution": output.get("summary", {}),
+        "avg_risk_score": round(sum(scores) / len(scores), 1),
+        "max_risk_score": max(scores),
+        "top_pattern": (
+            "high caller density + frequent buggy commits"
+            if any(h.get("risky_commits", 0) > 2 for h in heatmap[:5])
+            else "moderate risk - no concentrated danger zones"
+        ),
+    }
+
+
 def main():
     if len(sys.argv) < 2:
         _print_usage()
@@ -707,6 +951,15 @@ def main():
     incremental_mode = "--incremental" in args
     summary_mode = "--summary" in args
     history_mode = "--history" in args
+    scan_mode = "--scan" in args
+    export_risk_mode = "--export-risk" in args
+
+    # --repos: 提取跨仓库路径列表
+    cross_repo_paths: List[str] = []
+    for i, arg in enumerate(args):
+        if arg == "--repos" and i + 1 < len(args):
+            cross_repo_paths = [p.strip() for p in args[i + 1].split(",")]
+            break
 
     # 第一个非 flag 参数是项目路径
     project_path = None
@@ -740,6 +993,31 @@ def main():
         )
         sys.exit(1)
 
+    # --scan 模式：项目风险热力图（独立模式，不需要 diff）
+    if scan_mode:
+        print("正在扫描项目风险...", file=sys.stderr)
+        heatmap = _scan_project(project_root)
+        output = {
+            "mode": "scan",
+            "project": str(project_root),
+            "total_files_scanned": len(heatmap),
+            "heatmap": heatmap,
+            "summary": {
+                "critical": sum(1 for h in heatmap if h["risk_level"] == "critical"),
+                "high": sum(1 for h in heatmap if h["risk_level"] == "high"),
+                "medium": sum(1 for h in heatmap if h["risk_level"] == "medium"),
+                "low": sum(1 for h in heatmap if h["risk_level"] == "low"),
+            }
+        }
+        if summary_mode:
+            _print_heatmap(output)
+        elif export_risk_mode:
+            print(json.dumps(_export_anonymized_risk_for_scan(output),
+                             indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(output, indent=2, ensure_ascii=False))
+        return
+
     diff_text = run_git_diff(project_root)
     changed_files = parse_diff_files(diff_text)
     changed_functions = find_changed_functions(project_root, changed_files)
@@ -747,6 +1025,14 @@ def main():
         project_root, changed_functions, incremental=incremental_mode
     )
     dynamic_risks = detect_dynamic_risks(project_root)
+
+    # 跨仓库追踪
+    cross_repo_callers = []
+    if cross_repo_paths and changed_functions:
+        cross_repo_callers = _cross_repo_search(
+            project_root, changed_functions, cross_repo_paths
+        )
+
     git_history = _analyze_git_history(project_root, changed_functions) if history_mode else []
     behavior_suggestions = (
         _behavioral_diff_suggestion(changed_functions, project_root)
@@ -842,7 +1128,13 @@ def main():
         output["git_archaeology"] = git_history
         output["behavioral_diff"] = behavior_suggestions
 
-    if summary_mode:
+    if cross_repo_callers:
+        output["cross_repo_callers"] = cross_repo_callers
+
+    if export_risk_mode:
+        anon = _export_anonymized_risk(output)
+        print(json.dumps(anon, indent=2, ensure_ascii=False))
+    elif summary_mode:
         _print_summary(output)
     else:
         print(json.dumps(output, indent=2, ensure_ascii=False))
@@ -912,6 +1204,15 @@ def _print_summary(output: dict) -> None:
         for bd in output["behavioral_diff"]:
             print(f"  {bd['function']}({', '.join(bd['args'])})")
             print(f"    建议输入: {', '.join(bd['suggested_inputs'][:2])}")
+
+    # 跨仓库
+    if output.get("cross_repo_callers"):
+        cr = output["cross_repo_callers"]
+        print(f"\n  --- 跨仓库追踪: {len(cr)} 个外部调用方 ---")
+        for c in cr[:5]:
+            print(f"  {c['callee_name']}() -> {c['caller_repo']}/{c['caller_file']}")
+        if len(cr) > 5:
+            print(f"  ... 另外 {len(cr) - 5} 个")
 
     print(f"\n  --- 诚实声明 ---")
     print(f"  追踪方式: {hr['tracing_method']}")
@@ -1003,6 +1304,9 @@ def _print_help() -> None:
     python analyze.py <project_root> --pre-commit  pre-commit 检查（退出码 1=阻止）
     python analyze.py <project_root> --incremental 增量分析（大型项目推荐）
     python analyze.py <project_root> --history     完整分析 + Git考古 + 行为Diff建议
+    python analyze.py <project_root> --scan        项目风险热力图（全量扫描，无需 diff）
+    python analyze.py <project_root> --repos R1,R2 跨仓库追踪（在关联仓库中搜索调用方）
+    python analyze.py <project_root> --export-risk 导出匿名风险数据（可安全分享）
     python analyze.py --install-hook              一键安装 .git/hooks/pre-commit
     python analyze.py --version                   显示版本号
     python analyze.py --help                      显示此帮助
@@ -1024,6 +1328,15 @@ def _print_help() -> None:
 
     # 完整分析 + Git 考古 + 行为 Diff
     python path/to/analyze.py . --history --summary
+
+    # 项目风险热力图
+    python path/to/analyze.py . --scan --summary
+
+    # 跨仓库追踪（修改共享库后检查下游服务）
+    python path/to/analyze.py . --repos ../service-a,../service-b
+
+    # 导出匿名风险数据
+    python path/to/analyze.py . --export-risk
 
 pre-commit 模式:
     高风险 + 无测试调用方 → exit 1，阻止提交
