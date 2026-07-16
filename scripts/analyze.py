@@ -474,20 +474,7 @@ def detect_dynamic_risks(project_root: Path) -> List[Dict]:
 
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({
-            "error": "Usage: python analyze.py <project_root>",
-            "changed_functions": [],
-            "affected_callers": [],
-            "dynamic_risks": [],
-            "stats": {
-                "total_changed_files": 0,
-                "total_changed_functions": 0,
-                "total_affected_callers": 0,
-                "high_risk_count": 0,
-                "low_risk_count": 0,
-                "dynamic_risk_count": 0
-            }
-        }, indent=2, ensure_ascii=False))
+        _print_usage()
         sys.exit(1)
 
     if sys.argv[1] in ("--version", "-V", "-v"):
@@ -495,37 +482,19 @@ def main():
         sys.exit(0)
 
     if sys.argv[1] in ("--help", "-h"):
-        print(f"""test-shield v{__version__} — AST 调用链追踪脚本
-
-用法:
-    python analyze.py <project_root>              完整分析（全量 AST 扫描）
-    python analyze.py <project_root> --pre-commit  pre-commit 检查模式
-    python analyze.py <project_root> --incremental 增量分析（仅解析相关文件）
-    python analyze.py --version                   显示版本号
-    python analyze.py --help                      显示此帮助
-
-示例:
-    cd ~/my-python-project
-    python ~/.claude/skills/test-shield/scripts/analyze.py .
-    python ~/.claude/skills/test-shield/scripts/analyze.py . --pre-commit
-
-pre-commit 模式:
-    如果存在高风险 + 无测试保护的调用方 → exit 1，阻止提交
-    否则 exit 0，静默放行
-    用法：放到 .git/hooks/pre-commit 里
-
-增量模式:
-    先用 git grep 定位引用改动函数的 .py 文件，仅 AST 解析这些文件
-    1000 文件项目只改 1 个函数 → 解析 5-20 个文件而非 1000 个
-
-零依赖。纯 Python stdlib (ast + json + subprocess)。Python 3.10+。
-""")
+        _print_help()
         sys.exit(0)
+
+    # --install-hook：一键安装 pre-commit hook
+    if sys.argv[1] == "--install-hook":
+        _install_pre_commit_hook()
+        return
 
     # 解析参数
     args = sys.argv[1:]
     pre_commit_mode = "--pre-commit" in args
     incremental_mode = "--incremental" in args
+    summary_mode = "--summary" in args
 
     # 第一个非 flag 参数是项目路径
     project_path = None
@@ -544,17 +513,20 @@ pre-commit 模式:
     if not project_root.is_dir():
         print(json.dumps({
             "error": f"Not a directory: {project_root}",
-            "changed_functions": [],
-            "affected_callers": [],
-            "dynamic_risks": [],
-            "stats": {
-                "total_changed_files": 0,
-                "total_changed_functions": 0,
-                "total_affected_callers": 0,
-                "high_risk_count": 0,
-                "low_risk_count": 0,
-                "dynamic_risk_count": 0
-            }
+            "stats": _empty_stats()
+        }, indent=2, ensure_ascii=False))
+        sys.exit(1)
+
+    if not (project_root / ".git").is_dir():
+        print(json.dumps({
+            "error": (
+                f"'{project_root}' 不是 git 仓库。\n"
+                "Test Shield 需要 git diff 来分析代码改动。\n"
+                "请在 git 仓库中运行：\n"
+                "  cd your-python-project\n"
+                "  python path/to/analyze.py ."
+            ),
+            "stats": _empty_stats()
         }, indent=2, ensure_ascii=False))
         sys.exit(1)
 
@@ -578,7 +550,7 @@ pre-commit 模式:
     low_risk = [c for c in unique_callers if c["risk"] == "low"]
     high_risk_untested = [c for c in high_risk if not c["has_tests"]]
 
-    # --pre-commit 模式：检查高风险无测试调用方
+    # --pre-commit 模式
     if pre_commit_mode:
         if high_risk_untested:
             print(
@@ -598,26 +570,33 @@ pre-commit 模式:
                     file=sys.stderr
                 )
             print(
-                f"\n  跳过检查：git commit --no-verify",
-                file=sys.stderr
-            )
-            print(
-                f"  生成回归测试：运行 /test-shield",
-                file=sys.stderr
-            )
-            print(
-                f"  查看详情：python analyze.py .",
+                "\n  跳过检查：git commit --no-verify\n"
+                "  生成回归测试：运行 /test-shield\n"
+                "  查看详情：python analyze.py .",
                 file=sys.stderr
             )
             sys.exit(1)
         else:
-            # 静默退出 — 所有安全
             sys.exit(0)
 
     output = {
         "changed_functions": changed_functions,
         "affected_callers": unique_callers,
         "dynamic_risks": dynamic_risks,
+        "honesty_report": {
+            "tracing_method": (
+                "AST static analysis + git grep pre-filter"
+                if incremental_mode else "AST static analysis (full scan)"
+            ),
+            "test_coverage_verification": "not run (use pytest-cov after test generation)",
+            "dynamic_risks_detected": len(dynamic_risks),
+            "known_blind_spots": [
+                "getattr(obj, 'method') - dynamic attribute access",
+                "importlib.import_module() - dynamic imports",
+                "decorator-injected functions",
+                "monkey-patching at runtime",
+            ],
+        },
         "stats": {
             "total_changed_files": len(changed_files),
             "total_changed_functions": len(changed_functions),
@@ -629,7 +608,163 @@ pre-commit 模式:
         }
     }
 
-    print(json.dumps(output, indent=2, ensure_ascii=False))
+    if summary_mode:
+        _print_summary(output)
+    else:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+def _print_summary(output: dict) -> None:
+    """人类可读的摘要输出。"""
+    cf = output["changed_functions"]
+    callers = output["affected_callers"]
+    s = output["stats"]
+    hr = output["honesty_report"]
+
+    print()
+    if cf:
+        changed_file = cf[0]["file"]
+        print(f"  你改动了 {changed_file}:")
+        for f in cf:
+            print(f"    {f['name']}() L{f['line_start']}-{f['line_end']}")
+    else:
+        print("  未检测到函数级改动。")
+
+    print(f"\n  间接影响 {len(callers)} 个调用方:")
+    if callers:
+        for c in callers:
+            icon = "[HIGH]" if c["risk"] == "high" else "[LOW] "
+            test_status = "[有测试]" if c["has_tests"] else "[无测试]"
+            print(
+                f"    {icon} {c['caller_name']}()"
+                f" — {c['caller_file']}:{c['caller_line']}"
+                f"  {test_status}"
+            )
+    else:
+        print("    (无间接影响 — 这个改动没有下游调用方)")
+
+    print(f"\n  高风险且无测试: {s['high_risk_untested_count']} 个"
+          f"{' ← 提交前建议生成回归测试' if s['high_risk_untested_count'] else ''}")
+
+    print(f"\n  --- 诚实声明 ---")
+    print(f"  追踪方式: {hr['tracing_method']}")
+    print(f"  动态风险: {hr['dynamic_risks_detected']} 处")
+    if hr['dynamic_risks_detected'] > 0:
+        for dr in output["dynamic_risks"]:
+            print(f"    ! {dr['file']}:{dr['line']} — {dr['pattern']}")
+    print(f"  已知盲点: {', '.join(hr['known_blind_spots'][:2])}...")
+    print()
+
+
+def _install_pre_commit_hook() -> None:
+    """在 .git/hooks/pre-commit 中安装 Test Shield 检查。"""
+    cwd = Path.cwd()
+    git_dir = cwd / ".git"
+    if not git_dir.is_dir():
+        print("Error: 当前目录不是 git 仓库的根目录。", file=sys.stderr)
+        print("请在 git 仓库根目录运行：python analyze.py --install-hook", file=sys.stderr)
+        sys.exit(1)
+
+    hooks_dir = git_dir / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    hook_path = hooks_dir / "pre-commit"
+
+    analyze_path = Path(__file__).resolve()
+    hook_content = f"""#!/bin/bash
+# Test Shield — pre-commit hook
+# 安装方式：python {analyze_path} --install-hook
+# 跳过检查：git commit --no-verify
+
+python "{analyze_path}" . --pre-commit
+"""
+
+    # 如果已有 hook，追加而非覆盖
+    if hook_path.exists():
+        existing = hook_path.read_text()
+        if "test-shield" in existing.lower() or "test_shield" in existing.lower():
+            print("Test Shield pre-commit hook 已安装。")
+            print(f"  位置: {hook_path}")
+            return
+        # 备份原 hook，追加 Test Shield
+        backup_path = hook_path.with_suffix(".pre-commit.backup")
+        hook_path.rename(backup_path)
+        hook_content = (
+            f"#!/bin/bash\n"
+            f"# 原 pre-commit hook 备份在 {backup_path.name}\n"
+            f"# === 原 hook ===\n"
+            f"{existing}\n"
+            f"# === Test Shield ===\n"
+            f'python "{analyze_path}" . --pre-commit\n'
+        )
+
+    hook_path.write_text(hook_content)
+    # Unix: chmod +x; Windows: 无需（git bash 能执行）
+    try:
+        hook_path.chmod(0o755)
+    except Exception:
+        pass
+
+    print("Test Shield pre-commit hook 已安装。")
+    print(f"  位置: {hook_path}")
+    print(f"  以后每次 git commit 都会自动运行 Test Shield。")
+    print(f"  跳过检查：git commit --no-verify")
+
+
+def _empty_stats() -> dict:
+    return {
+        "total_changed_files": 0,
+        "total_changed_functions": 0,
+        "total_affected_callers": 0,
+        "high_risk_count": 0,
+        "low_risk_count": 0,
+        "high_risk_untested_count": 0,
+        "dynamic_risk_count": 0,
+    }
+
+
+def _print_usage() -> None:
+    print(json.dumps({
+        "error": "Usage: python analyze.py <project_root>",
+        "stats": _empty_stats()
+    }, indent=2, ensure_ascii=False))
+
+
+def _print_help() -> None:
+    print(f"""test-shield v{__version__} — AST 调用链追踪脚本
+
+用法:
+    python analyze.py <project_root>              完整分析（全量 AST 扫描）
+    python analyze.py <project_root> --summary     人类可读摘要
+    python analyze.py <project_root> --pre-commit  pre-commit 检查（退出码 1=阻止）
+    python analyze.py <project_root> --incremental 增量分析（大型项目推荐）
+    python analyze.py --install-hook              一键安装 .git/hooks/pre-commit
+    python analyze.py --version                   显示版本号
+    python analyze.py --help                      显示此帮助
+
+示例:
+    cd ~/my-python-project
+
+    # 看看改动了什么、影响了谁
+    python path/to/analyze.py . --summary
+
+    # 提交前检查
+    python path/to/analyze.py . --pre-commit
+
+    # 永久装上 pre-commit hook
+    python path/to/analyze.py --install-hook
+
+    # 大型项目用增量模式
+    python path/to/analyze.py . --incremental
+
+pre-commit 模式:
+    高风险 + 无测试调用方 → exit 1，阻止提交
+    全部安全 → exit 0，静默放行
+
+增量模式:
+    git grep 预筛选 → 只解析相关文件。1000 文件项目改 1 个函数 → <1 秒。
+
+零依赖。纯 Python stdlib (ast + json + subprocess)。Python 3.10+。
+""")
 
 
 if __name__ == "__main__":

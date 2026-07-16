@@ -16,6 +16,18 @@ A [Claude Code](https://claude.com/claude-code) skill that finds every call site
   <img src="examples/demo.gif" width="700" alt="Test Shield Demo">
 </p>
 
+> 🚀 **30 秒试用：** `bash examples/demo.sh` — 自动搭建演示项目、改代码、跑 Test Shield。不需要手动造任何东西。
+
+---
+
+## Which Way Do You Want to Use It?
+
+| 我想... | 用这个 | 一句话 |
+|---------|--------|--------|
+| 🖥️ 在命令行快速查看改动影响了谁 | `python analyze.py . --summary` | 不需要 AI，不需要 Claude Code |
+| 🚫 提交前自动检查高风险改动 | `python analyze.py --install-hook` | 以后每次 `git commit` 自动跑 |
+| 🤖 让 AI 帮我生成回归测试 | `/test-shield` (Claude Code) | 交互式：追踪 → 确认 → 生成 pytest → 运行 |
+
 ---
 
 ## The Problem
