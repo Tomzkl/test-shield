@@ -483,6 +483,206 @@ def detect_dynamic_risks(project_root: Path) -> List[Dict]:
     return risks
 
 
+# === 三个预测功能 ===
+
+# 风险 commit 关键词 — 匹配了说明这个函数历史上出过事
+RISKY_COMMIT_PATTERNS = [
+    re.compile(r"\bfix\b", re.IGNORECASE),
+    re.compile(r"\bbug\b", re.IGNORECASE),
+    re.compile(r"\bregression\b", re.IGNORECASE),
+    re.compile(r"\brevert\b", re.IGNORECASE),
+    re.compile(r"\bhotfix\b", re.IGNORECASE),
+    re.compile(r"\bbreak(s|ing)?\b", re.IGNORECASE),
+    re.compile(r"\bcrash\b", re.IGNORECASE),
+    re.compile(r"\bwrong\b", re.IGNORECASE),
+    re.compile(r"\bincorrect\b", re.IGNORECASE),
+    re.compile(r"\bunexpected\b", re.IGNORECASE),
+]
+
+# 关键路径前缀 — 匹配了说明这个调用方是用户触达面
+CRITICAL_PATH_PATTERNS = [
+    re.compile(r"(api|endpoint|handler|controller|view|route)", re.IGNORECASE),
+    re.compile(r"(create|delete|update|submit|process|checkout|pay|refund)", re.IGNORECASE),
+]
+
+
+def _analyze_git_history(project_root: Path, changed_functions: List[Dict]) -> List[Dict]:
+    """Git 考古：分析每个改动函数的历史风险。
+
+    用 git log 追踪函数所在文件的历史变更，
+    统计总修改次数、风险 commit 次数、最近修改时间，
+    输出 0-100 的风险评分。
+    """
+    history = []
+    for cf in changed_functions:
+        filepath = cf["file"]
+        try:
+            result = subprocess.run(
+                ["git", "log", "--follow", "--oneline", "--", filepath],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=project_root
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                history.append({
+                    "function": cf["name"],
+                    "file": filepath,
+                    "total_commits": 0,
+                    "risky_commits": 0,
+                    "risk_score": 0,
+                    "risk_level": "unknown",
+                    "recent_risky": [],
+                })
+                continue
+
+            commits = result.stdout.strip().split("\n")
+            total = len(commits)
+            risky = []
+            for c in commits:
+                for pat in RISKY_COMMIT_PATTERNS:
+                    if pat.search(c):
+                        risky.append(c.strip()[:80])
+                        break
+
+            risk_score = min(100, int((len(risky) / max(total, 1)) * 100 + len(risky) * 8))
+            if risk_score >= 70:
+                risk_level = "critical"
+            elif risk_score >= 40:
+                risk_level = "high"
+            elif risk_score >= 15:
+                risk_level = "medium"
+            else:
+                risk_level = "low"
+
+            history.append({
+                "function": cf["name"],
+                "file": filepath,
+                "total_commits": total,
+                "risky_commits": len(risky),
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "recent_risky": risky[-3:],  # 最近 3 条风险 commit
+            })
+        except Exception:
+            history.append({
+                "function": cf["name"],
+                "file": filepath,
+                "total_commits": 0,
+                "risky_commits": 0,
+                "risk_score": 0,
+                "risk_level": "error",
+                "recent_risky": [],
+            })
+
+    return history
+
+
+def _classify_criticality(
+    callers: List[Dict], changed_functions: List[Dict]
+) -> List[Dict]:
+    """最小安全集分析：按"用户触达距离"分类每个调用方。
+
+    [必须测] — 直接用户触达面（API/handler/controller/支付/退款）
+    [建议测] — 间接用户触达（被关键路径调用、涉及资金计算）
+    [可选]   — 内部工具/报表/日志
+    """
+    classified = []
+    for c in callers:
+        name = c["caller_name"]
+        file = c["caller_file"]
+
+        # 判断用户触达距离
+        is_critical = False
+        for pat in CRITICAL_PATH_PATTERNS:
+            if pat.search(name) or pat.search(file):
+                is_critical = True
+                break
+
+        if is_critical and c["risk"] == "high":
+            tier = "must"       # 必须测
+            tier_label = "[必须测]"
+        elif c["risk"] == "high":
+            tier = "should"     # 建议测
+            tier_label = "[建议测]"
+        else:
+            tier = "optional"   # 可选
+            tier_label = "[可选]  "
+
+        classified.append({**c, "criticality": tier, "tier_label": tier_label})
+
+    return classified
+
+
+def _build_diff_command(cf: Dict, test_inputs: List[str]) -> str:
+    """构建行为 Diff 的命令行建议（避免 f-string 中的反斜杠）。"""
+    module_path = cf["file"].replace("/", ".").replace("\\", ".")
+    if module_path.endswith(".py"):
+        module_path = module_path[:-3]
+    first_input = test_inputs[0] if test_inputs else ""
+    return (
+        "# 旧行为: git show HEAD:FILE | python -c '...'\n"
+        f"# 新行为: python -c 'from {module_path} import {cf['name']};"
+        f" print({cf['name']}({first_input}))'"
+    )
+
+
+def _behavioral_diff_suggestion(
+    changed_functions: List[Dict], project_root: Path
+) -> List[Dict]:
+    """行为 Diff 建议：为每个改动函数生成一组输入/输出对比的测试框架。
+
+    不做实际执行（安全考虑），而是生成测试输入建议和对比模板。
+    用户可以用这个模板手动跑对比。
+    """
+    suggestions = []
+    for cf in changed_functions:
+        filepath = project_root / cf["file"]
+        if not filepath.exists():
+            continue
+
+        try:
+            source = filepath.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except Exception:
+            continue
+
+        for node in ast.walk(tree):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == cf["name"]):
+                args = [a.arg for a in node.args.args if a.arg != "self"]
+                # 根据参数名猜测测试输入
+                test_inputs = _suggest_inputs(args, node.name)
+                suggestions.append({
+                    "function": cf["name"],
+                    "file": cf["file"],
+                    "args": args,
+                    "suggested_inputs": test_inputs,
+                    "comparison_cmd": _build_diff_command(cf, test_inputs),
+                })
+                break
+
+    return suggestions
+
+
+def _suggest_inputs(args: List[str], func_name: str) -> List[str]:
+    """根据参数名启发式推测测试输入值。"""
+    suggestions = []
+    for arg in args:
+        low = arg.lower()
+        if any(w in low for w in ("amount", "price", "total", "tax", "rate", "discount")):
+            suggestions.append("0, 1, 100, 1000")
+        elif any(w in low for w in ("name", "id", "code", "key", "token", "email")):
+            suggestions.append('"test_value", "", None')
+        elif any(w in low for w in ("items", "orders", "data", "list", "array")):
+            suggestions.append("[], [{}]")
+        elif any(w in low for w in ("flag", "enable", "debug", "verbose")):
+            suggestions.append("True, False")
+        elif any(w in low for w in ("count", "limit", "offset", "page", "size")):
+            suggestions.append("0, 1, 10, 100")
+        else:
+            suggestions.append("0, None, 'test'")
+    return suggestions
+
+
 def main():
     if len(sys.argv) < 2:
         _print_usage()
@@ -506,6 +706,7 @@ def main():
     pre_commit_mode = "--pre-commit" in args
     incremental_mode = "--incremental" in args
     summary_mode = "--summary" in args
+    history_mode = "--history" in args
 
     # 第一个非 flag 参数是项目路径
     project_path = None
@@ -546,6 +747,11 @@ def main():
         project_root, changed_functions, incremental=incremental_mode
     )
     dynamic_risks = detect_dynamic_risks(project_root)
+    git_history = _analyze_git_history(project_root, changed_functions) if history_mode else []
+    behavior_suggestions = (
+        _behavioral_diff_suggestion(changed_functions, project_root)
+        if history_mode else []
+    )
 
     seen = set()
     unique_callers = []
@@ -555,11 +761,16 @@ def main():
             seen.add(key)
             unique_callers.append(c)
 
+    # 最小安全集分类
+    unique_callers = _classify_criticality(unique_callers, changed_functions)
+
     high_risk = [c for c in unique_callers if c["risk"] == "high"]
     low_risk = [c for c in unique_callers if c["risk"] == "low"]
     high_risk_untested = [c for c in high_risk if not c["has_tests"]]
+    must_test = [c for c in high_risk_untested if c.get("criticality") == "must"]
+    should_test = [c for c in high_risk_untested if c.get("criticality") == "should"]
 
-    # --pre-commit 模式
+    # --pre-commit 模式（含最小安全集提示）
     if pre_commit_mode:
         if high_risk_untested:
             print(
@@ -567,21 +778,26 @@ def main():
                 f"高风险调用方，它们没有测试保护。\n",
                 file=sys.stderr
             )
-            for c in high_risk_untested[:5]:
-                print(
-                    f"  {c['caller_name']}() - "
-                    f"{c['caller_file']}:{c['caller_line']}",
-                    file=sys.stderr
-                )
-            if len(high_risk_untested) > 5:
-                print(
-                    f"  ... 另外 {len(high_risk_untested) - 5} 个调用方",
-                    file=sys.stderr
-                )
+            # 最小安全集：先展示必须测的
+            if must_test:
+                print("  [最小安全集 — 必须测]", file=sys.stderr)
+                for c in must_test[:5]:
+                    print(
+                        f"    {c['caller_name']}() - "
+                        f"{c['caller_file']}:{c['caller_line']}",
+                        file=sys.stderr
+                    )
+            if should_test:
+                print(f"  [建议测 — {len(should_test)} 个]", file=sys.stderr)
+            remaining = [c for c in high_risk_untested
+                        if c.get("criticality") not in ("must", "should")]
+            if remaining:
+                print(f"  [可选 — {len(remaining)} 个]", file=sys.stderr)
             print(
-                "\n  跳过检查：git commit --no-verify\n"
-                "  生成回归测试：运行 /test-shield\n"
-                "  查看详情：python analyze.py .",
+                f"\n  最小安全集: 补 {len(must_test) + len(should_test)} 个测试即可安全合入\n"
+                f"  跳过检查：git commit --no-verify\n"
+                f"  生成回归测试：运行 /test-shield\n"
+                f"  查看详情：python analyze.py .",
                 file=sys.stderr
             )
             sys.exit(1)
@@ -613,9 +829,18 @@ def main():
             "high_risk_count": len(high_risk),
             "low_risk_count": len(low_risk),
             "high_risk_untested_count": len(high_risk_untested),
-            "dynamic_risk_count": len(dynamic_risks)
+            "dynamic_risk_count": len(dynamic_risks),
+            "minimal_safe_set": {
+                "must_test": len(must_test),
+                "should_test": len(should_test),
+                "optional": len(high_risk_untested) - len(must_test) - len(should_test),
+            },
         }
     }
+
+    if history_mode and git_history:
+        output["git_archaeology"] = git_history
+        output["behavioral_diff"] = behavior_suggestions
 
     if summary_mode:
         _print_summary(output)
@@ -653,7 +878,40 @@ def _print_summary(output: dict) -> None:
         print("    (无间接影响 - 这个改动没有下游调用方)")
 
     print(f"\n  高风险且无测试: {s['high_risk_untested_count']} 个"
-          f"{' ← 提交前建议生成回归测试' if s['high_risk_untested_count'] else ''}")
+          f"{' <- 提交前建议生成回归测试' if s['high_risk_untested_count'] else ''}")
+
+    # 最小安全集
+    mss = s.get("minimal_safe_set", {})
+    if mss.get("must_test", 0) + mss.get("should_test", 0) > 0:
+        print(f"\n  --- 最小安全集 ---")
+        print(f"  [必须测] {mss['must_test']} 个 - 直接用户触达面")
+        print(f"  [建议测] {mss['should_test']} 个 - 间接用户触达")
+        print(f"  [可选]   {mss['optional']} 个 - 内部工具/报表")
+        print(f"  补 {mss['must_test'] + mss['should_test']} 个测试即可安全合入")
+
+    # Git 考古
+    if output.get("git_archaeology"):
+        print(f"\n  --- Git 考古 ---")
+        for gh in output["git_archaeology"]:
+            icon = "!!" if gh["risk_score"] >= 70 else "! " if gh["risk_score"] >= 40 else "~ " if gh["risk_score"] >= 15 else "  "
+            print(
+                f"  {icon} {gh['function']}() - "
+                f"risk {gh['risk_score']}/100 ({gh['risk_level']})"
+            )
+            if gh["total_commits"] > 0:
+                print(
+                    f"     历史: {gh['total_commits']} 次修改, "
+                    f"{gh['risky_commits']} 次出过 bug"
+                )
+            if gh["recent_risky"]:
+                print(f"     最近: {gh['recent_risky'][0][:70]}")
+
+    # 行为 Diff
+    if output.get("behavioral_diff"):
+        print(f"\n  --- 行为 Diff 建议 ---")
+        for bd in output["behavioral_diff"]:
+            print(f"  {bd['function']}({', '.join(bd['args'])})")
+            print(f"    建议输入: {', '.join(bd['suggested_inputs'][:2])}")
 
     print(f"\n  --- 诚实声明 ---")
     print(f"  追踪方式: {hr['tracing_method']}")
@@ -744,6 +1002,7 @@ def _print_help() -> None:
     python analyze.py <project_root> --summary     人类可读摘要
     python analyze.py <project_root> --pre-commit  pre-commit 检查（退出码 1=阻止）
     python analyze.py <project_root> --incremental 增量分析（大型项目推荐）
+    python analyze.py <project_root> --history     完整分析 + Git考古 + 行为Diff建议
     python analyze.py --install-hook              一键安装 .git/hooks/pre-commit
     python analyze.py --version                   显示版本号
     python analyze.py --help                      显示此帮助
@@ -762,6 +1021,9 @@ def _print_help() -> None:
 
     # 大型项目用增量模式
     python path/to/analyze.py . --incremental
+
+    # 完整分析 + Git 考古 + 行为 Diff
+    python path/to/analyze.py . --history --summary
 
 pre-commit 模式:
     高风险 + 无测试调用方 → exit 1，阻止提交
