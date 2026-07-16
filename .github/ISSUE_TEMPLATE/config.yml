@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 💬 讨论 / Discussions
+    url: https://github.com/dominicharmon-commits/test-shield/discussions
+    about: 分享使用经验、提建议、或者随便聊聊
+  - name: 📖 FAQ
+    url: https://github.com/dominicharmon-commits/test-shield/blob/main/docs/faq.md
+    about: 提问前先看 FAQ，你的问题可能已经有答案了

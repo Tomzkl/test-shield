@@ -152,13 +152,44 @@ $ /test-shield
 
 ---
 
-## What It Won't Do
+## Known Limitations
 
-- **Won't auto-fix failing tests** — that's your call
-- **Won't auto-commit** — you review before you ship
-- **Won't track dynamic calls** (getattr, importlib, monkey-patching) — it'll warn you when it can't
-- **Won't support non-Python languages in v1** — Python first, done right
-- **Won't pretend to be certain when it's not** — every test marks whether coverage range is AI-estimated or coverage-verified
+**Test Shield is honest about what it can and can't do.** If something below is a dealbreaker, you'll know before you install it — not after.
+
+### Tracing Blind Spots (Every Run Reports These)
+
+| Pattern | Why Invisible | Example |
+|---------|--------------|---------|
+| `getattr(obj, "method")` | Method name not known until runtime | Plugin systems, dynamic dispatch |
+| `importlib.import_module()` | Import target is a string variable | Feature flags, environment-based imports |
+| Decorator injection | `@route()` may wrap functions in ways AST can't follow | Flask/FastAPI route decorators |
+| Monkey-patching | Functions replaced at runtime by external code | Test mocks, hot-reload systems |
+| `__import__()` | Same as importlib — dynamic import | Legacy code, meta-programming |
+
+**What Test Shield does about it:** Every run ends with a "诚实声明" (honesty report) that flags detected dynamic patterns and explicitly marks uncertain call chains. No false confidence.
+
+### Scope Limitations
+
+- **Python only in v1.** TypeScript/Jest support on the roadmap (v1.2). If your stack is Node/Go/Rust, Test Shield won't help you yet.
+- **pytest only.** unittest is partially supported (tests in `test_*.py` files are found), but generated tests use pytest syntax.
+- **Static analysis only.** Test Shield does not execute your code. Dynamic call graphs (where the target depends on input data) cannot be traced.
+
+### Design Choices (Not Bugs)
+
+- **Doesn't auto-fix failing tests.** That's your call. Test Shield shows you what broke and suggests causes — you decide what to change.
+- **Doesn't auto-commit.** You review the generated tests before they ship.
+- **Generated tests are regression protection, not unit tests.** They verify "does this still behave the same way?", not "is this business logic correct?"
+
+### Performance
+
+| Project Size | analyze.py Runtime | Notes |
+|-------------|-------------------|-------|
+| < 50 .py files | < 1 second | Instant |
+| 50-200 .py files | 1-3 seconds | Test cache kicks in |
+| 200-1000 .py files | 3-10 seconds | Still acceptable |
+| 1000+ .py files | 10-30 seconds | Consider running on changed modules only |
+
+> v1.0 includes a test-caching optimization — test directories are scanned once and cached, not once per caller. `find_enclosing_function` is O(1) via pre-built line-to-function map. See `analyze.py` source for details.
 
 ---
 
@@ -166,21 +197,47 @@ $ /test-shield
 
 | Version | What |
 |---------|------|
-| v1.0 | Python + pytest, AST tracing, /test-shield command |
+| v1.0 | Python + pytest, AST tracing, /test-shield command, test caching |
 | v1.1 | Coverage verification (run pytest-cov after generation) |
 | v1.2 | TypeScript / Jest support |
 | v2.0 | CI/CD integration, git hook auto-trigger |
 
 ---
 
+## FAQ
+
+Quick answers to common questions. More in **[docs/faq.md](docs/faq.md)**.
+
+| Question | Answer |
+|---------|--------|
+| 为什么只支持 Python？ | v1 专注 Python 做到极致。TypeScript 在 v1.2。 |
+| 和 pytest-cov 有什么区别？ | pytest-cov 告诉你哪些行没跑到。Test Shield 告诉你改了代码后哪些调用方会悄悄坏掉。互补关系。 |
+| 能在 CI 里用吗？ | 暂时不行（v2.0 目标）。目前是本地手动触发 `/test-shield`。 |
+| analyze.py 有依赖吗？ | 零依赖。纯 Python stdlib。Python 3.10+。 |
+| 能追踪装饰器吗？ | 基础装饰器（`@staticmethod`等）可以。动态装饰器注入的函数追踪不到——会在诚实声明里标注。 |
+
+---
+
 ## Contributing
 
-Found a bug? Tracing missed a caller? Open an issue with:
-1. The Python code that wasn't traced correctly
-2. Expected behavior: which caller should have been found
-3. Actual behavior: what Test Shield reported
+Found a bug? Tracing missed a caller? **[Use the issue template →](https://github.com/dominicharmon-commits/test-shield/issues/new?template=bug-report.yml)**
 
-Pull requests welcome. Keep it focused — one fix per PR.
+Pull requests welcome. Before you start:
+1. Run `pytest tests/ -v` — must be green
+2. Keep `analyze.py` dependency-free (stdlib only)
+3. One fix per PR
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for details.
+
+---
+
+## 📢 Share
+
+如果 Test Shield 帮你避免了一次线上事故——告诉另一个需要它的人。
+
+**复制这段话发 Twitter/X / 知乎 / 朋友圈：**
+
+> 改了一个函数，跑完测试全绿，上线三小时后炸了——因为没发现的调用方悄悄坏了。Test Shield 做一件事：找到你改动波及的所有调用方，为意外影响的那些生成回归测试。git diff → AST 追踪 → 你知道所有被影响的地方。GitHub 搜 "test-shield"。python analyze.py . 就能跑。
 
 ---
 

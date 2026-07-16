@@ -1,0 +1,63 @@
+---
+name: 🐛 Bug 报告
+description: 追踪遗漏了某个调用方、生成的测试有问题、或者其他 bug
+title: "[Bug] 简短描述问题"
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: type
+    attributes:
+      label: Bug 类型
+      options:
+        - 调用方追踪遗漏（应该找到但没找到）
+        - 调用方误报（不应该列为受影响但列了）
+        - 生成的测试有错误
+        - analyze.py 脚本报错
+        - 文档/说明错误
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 提供能复现问题的最小 Python 代码示例
+      placeholder: |
+        1. 创建文件 `foo.py`，内容如下：
+        ```python
+        def target(): return 1
+        ```
+        2. 创建文件 `bar.py`，内容如下：
+        ```python
+        from foo import target
+        def caller(): return target()
+        ```
+        3. 改动 `target()` 然后运行 analyze.py
+        4. 预期找到 `caller()`，实际没找到
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      description: 你预期 Test Shield 做什么？
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: Test Shield 实际做了什么？
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: analyze.py 版本
+      description: "运行 `python analyze.py --version` 获取"
+      placeholder: "v1.0.0"
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      placeholder: "Python 3.10.11"

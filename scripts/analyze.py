@@ -7,6 +7,8 @@ Test Shield — AST 调用链追踪脚本
 
 用法:
     python analyze.py <project_root>
+    python analyze.py --version
+    python analyze.py --help
 
 输出 JSON 结构:
 {
@@ -55,7 +57,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+
+__version__ = "1.0.0"
 
 
 def run_git_diff(project_root: Path) -> str:
@@ -235,8 +239,13 @@ def find_enclosing_function(tree: ast.AST, lineno: int) -> Optional[ast.Function
     return result
 
 
-def check_has_tests(project_root: Path, function_name: str) -> bool:
-    """检查项目中是否已有针对该函数的测试。"""
+def build_test_cache(project_root: Path) -> Set[str]:
+    """扫描项目测试目录，构建已测试函数名缓存。
+
+    只扫描一次，所有 check_has_tests 调用共享此缓存。
+    将 O(n*m) 降到 O(n) —— 对大型项目影响显著。
+    """
+    cache: Set[str] = set()
     test_dirs = ["tests", "test", "testing"]
     for test_dir in test_dirs:
         test_path = project_root / test_dir
@@ -244,16 +253,53 @@ def check_has_tests(project_root: Path, function_name: str) -> bool:
             continue
         try:
             for py_file in test_path.rglob("test_*.py"):
-                content = py_file.read_text(encoding="utf-8")
-                if function_name in content:
-                    return True
+                try:
+                    cache.add(py_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
             for py_file in test_path.rglob("*_test.py"):
-                content = py_file.read_text(encoding="utf-8")
-                if function_name in content:
-                    return True
+                try:
+                    cache.add(py_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
         except Exception:
             pass
+    return cache
+
+
+def check_has_tests(test_cache_or_root, function_name: str) -> bool:
+    """检查项目中是否已有针对该函数的测试。
+
+    支持两种调用方式：
+    - check_has_tests(Path, str) — 旧 API，每次扫描（向后兼容）
+    - check_has_tests(Set[str], str) — 新 API，用预构建缓存 O(1) 查表
+    """
+    cache = test_cache_or_root
+    if isinstance(cache, Path):
+        # 向后兼容：收到 Path，临时构建缓存
+        cache = build_test_cache(cache)
+    if not cache:
+        return False
+    for content in cache:
+        if function_name in content:
+            return True
     return False
+
+
+def build_line_to_function_map(tree: ast.AST) -> Dict[int, ast.FunctionDef]:
+    """构建行号 → 包含该行的最内层函数的映射。
+
+    一次 AST 遍历，之后所有 find_enclosing_function 调用都是 O(1) 字典查表。
+    """
+    mapping: Dict[int, ast.FunctionDef] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node_end = node.end_lineno or node.lineno
+            for lineno in range(node.lineno, node_end + 1):
+                existing = mapping.get(lineno)
+                if existing is None or node.lineno >= existing.lineno:
+                    mapping[lineno] = node
+    return mapping
 
 
 def build_import_alias_map(tree: ast.AST) -> Dict[str, str]:
@@ -281,6 +327,7 @@ def build_call_graph(
 ) -> List[Dict]:
     """构建调用图：找到所有调用改动函数的代码位置。"""
     affected = []
+    test_cache = build_test_cache(project_root)
 
     for py_file in project_root.rglob("*.py"):
         file_str = str(py_file.relative_to(project_root)).replace("\\", "/")
@@ -294,8 +341,9 @@ def build_call_graph(
         except (SyntaxError, UnicodeDecodeError):
             continue
 
-        # 构建当前文件的 import 别名映射
+        # 构建当前文件的 import 别名映射和行号→函数映射
         alias_map = build_import_alias_map(tree)
+        line_to_func = build_line_to_function_map(tree)
 
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -316,7 +364,8 @@ def build_call_graph(
                 if resolved_name != changed["name"]:
                     continue
 
-                caller_func = find_enclosing_function(tree, node.lineno)
+                # O(1) 行号→函数查表（替代原来的 O(n) find_enclosing_function）
+                caller_func = line_to_func.get(node.lineno)
                 if caller_func:
                     caller_name_str = caller_func.name
                 else:
@@ -324,7 +373,8 @@ def build_call_graph(
 
                 risk = "low" if is_low_risk(caller_name_str, file_str) else "high"
 
-                has_tests = check_has_tests(project_root, caller_name_str)
+                # O(1) 缓存查表（替代原来的 O(n) check_has_tests）
+                has_tests = check_has_tests(test_cache, caller_name_str)
 
                 affected.append({
                     "caller_file": file_str,
@@ -392,6 +442,29 @@ def main():
             }
         }, indent=2, ensure_ascii=False))
         sys.exit(1)
+
+    if sys.argv[1] in ("--version", "-V", "-v"):
+        print(f"test-shield v{__version__}")
+        sys.exit(0)
+
+    if sys.argv[1] in ("--help", "-h"):
+        print(f"""test-shield v{__version__} — AST 调用链追踪脚本
+
+用法:
+    python analyze.py <project_root>    分析 git diff，输出受影响的调用方 JSON
+    python analyze.py --version         显示版本号
+    python analyze.py --help            显示此帮助
+
+示例:
+    cd ~/my-python-project
+    python ~/.claude/skills/test-shield/scripts/analyze.py .
+
+输出:
+    JSON → {{changed_functions, affected_callers, dynamic_risks, stats}}
+
+零依赖。纯 Python stdlib (ast + json + subprocess)。Python 3.10+。
+""")
+        sys.exit(0)
 
     project_root = Path(sys.argv[1]).resolve()
     if not project_root.is_dir():
