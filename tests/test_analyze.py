@@ -5,6 +5,7 @@ Test Shield — analyze.py 单元测试
 import ast
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -14,6 +15,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 import analyze
+
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 
 
 class TestMergeLineRanges:
@@ -285,3 +288,136 @@ class TestEndToEnd:
             # 验证：stats 合理
             assert data["stats"]["total_changed_functions"] == 1
             assert data["stats"]["total_affected_callers"] >= 1
+
+            # 验证：honesty_report 存在
+            assert "honesty_report" in data
+            assert "known_blind_spots" in data["honesty_report"]
+            assert "tracing_method" in data["honesty_report"]
+
+
+class TestCLIFlags:
+    """命令行标志行为测试。"""
+
+    def _setup_project(self, project: Path):
+        """创建含改动的基础测试项目。返回 project Path。"""
+        import subprocess as sp
+        sp.run(["git", "init", "-q"], cwd=project, capture_output=True)
+        sp.run(["git", "config", "user.email", "t@t.com"], cwd=project, capture_output=True)
+        sp.run(["git", "config", "user.name", "t"], cwd=project, capture_output=True)
+
+        (project / "src").mkdir(exist_ok=True)
+        (project / "src" / "__init__.py").touch()
+        (project / "src" / "core.py").write_text(
+            "def get_price(item):\n    return item['price']\n", encoding="utf-8")
+        (project / "src" / "order.py").write_text(
+            "from src.core import get_price\n"
+            "def checkout(item):\n    return get_price(item)\n", encoding="utf-8")
+
+        sp.run(["git", "add", "-A"], cwd=project, capture_output=True)
+        sp.run(["git", "commit", "-q", "-m", "init"], cwd=project, capture_output=True)
+
+        # 修改 get_price
+        (project / "src" / "core.py").write_text(
+            "def get_price(item):\n"
+            "    price = item['price']\n"
+            "    return max(price, 1)\n", encoding="utf-8")
+
+    def test_pre_commit_blocks_untested_changes(self):
+        """--pre-commit: 高风险无测试 → exit 1"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+            self._setup_project(project)
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "analyze.py"), str(project),
+                 "--pre-commit"],
+                capture_output=True, text=True, encoding="utf-8"
+            )
+            assert result.returncode == 1
+            assert "checkout" in result.stderr
+
+    def test_pre_commit_passes_when_all_tested(self):
+        """--pre-commit: 有测试保护 → exit 0"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+            self._setup_project(project)
+
+            # 为 checkout 加测试
+            test_dir = project / "tests"
+            test_dir.mkdir()
+            (test_dir / "test_order.py").write_text(
+                "from src.order import checkout\n"
+                "def test_checkout():\n"
+                "    assert checkout({'price': 10}) == 10\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "analyze.py"), str(project),
+                 "--pre-commit"],
+                capture_output=True, text=True
+            )
+            assert result.returncode == 0
+
+    def test_summary_mode_human_readable(self):
+        """--summary: 输出人类可读内容而非 JSON"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+            self._setup_project(project)
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "analyze.py"), str(project),
+                 "--summary"],
+                capture_output=True, text=True, encoding="utf-8"
+            )
+            assert result.returncode == 0
+            assert result.stdout is not None and len(result.stdout) > 0
+            # 不输出 JSON（summary 模式不应有 JSON 结构）
+            assert not result.stdout.strip().startswith("{")
+
+    def test_incremental_mode_works(self):
+        """--incremental: 增量模式正常返回 JSON"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+            self._setup_project(project)
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "analyze.py"), str(project),
+                 "--incremental"],
+                capture_output=True, text=True
+            )
+            assert result.returncode == 0
+            data = json.loads(result.stdout)
+            assert "error" not in data
+            assert data["stats"]["total_changed_functions"] >= 1
+
+    def test_version_flag(self):
+        """--version: 输出版本号"""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "analyze.py"), "--version"],
+            capture_output=True, text=True
+        )
+        assert result.returncode == 0
+        assert "test-shield" in result.stdout
+
+    def test_help_flag(self):
+        """--help: 输出帮助信息"""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "analyze.py"), "--help"],
+            capture_output=True, text=True, encoding="utf-8"
+        )
+        assert result.returncode == 0
+        assert result.stdout is not None and len(result.stdout) > 0
+        assert "pre-commit" in result.stdout
+        assert "summary" in result.stdout
+        assert "install-hook" in result.stdout
+        assert "incremental" in result.stdout
+
+    def test_non_git_directory_error(self):
+        """非 git 目录 → exit 1, stderr 有提示"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "analyze.py"), str(project)],
+                capture_output=True, text=True, encoding="utf-8"
+            )
+            assert result.returncode == 1
+            assert result.stderr is not None and len(result.stderr) > 0

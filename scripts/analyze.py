@@ -59,6 +59,14 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# 强制 UTF-8 输出，解决 Windows GBK 终端中文乱码
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 __version__ = "1.0.0"
 
 
@@ -83,7 +91,7 @@ def run_git_diff(project_root: Path) -> str:
                 result += "\n"
             result += staged.stdout
     except Exception as e:
-        print(json.dumps({"error": f"Git diff failed: {e}"}))
+        print(f"Error: git diff 失败 - {e}", file=sys.stderr)
         sys.exit(1)
     return result
 
@@ -143,12 +151,24 @@ def parse_diff_files(diff_text: str) -> List[Dict]:
     return changed_files
 
 
+def _build_class_map(tree: ast.AST) -> Dict[int, Optional[str]]:
+    """构建行号 → 所属类名的映射。一次 AST 遍历，所有函数 O(1) 查表。"""
+    class_map: Dict[int, Optional[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            node_end = node.end_lineno or node.lineno
+            for lineno in range(node.lineno, node_end + 1):
+                class_map[lineno] = node.name
+    return class_map
+
+
 def find_changed_functions(
     project_root: Path, changed_files: List[Dict]
 ) -> List[Dict]:
     """找到每个改动文件中受影响的函数。
 
     策略：解析 Python 文件的 AST，找出改动行范围内的函数定义。
+    先构建 class 行号映射（O(n)），再检测函数（O(m)），总计 O(n+m)。
     """
     results = []
 
@@ -164,6 +184,7 @@ def find_changed_functions(
             continue
 
         changed_ranges = file_info["added_lines"]
+        class_map = _build_class_map(tree)
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -172,18 +193,8 @@ def find_changed_functions(
 
                 for r_start, r_end in changed_ranges:
                     if func_start <= r_end and func_end >= r_start:
-                        class_name = None
-                        for parent in ast.walk(tree):
-                            if (isinstance(parent, ast.ClassDef)
-                                    and parent.lineno <= func_start
-                                    and (parent.end_lineno or parent.lineno) >= func_end):
-                                if any(
-                                    n is node
-                                    for n in ast.walk(parent)
-                                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                ):
-                                    class_name = parent.name
-                                    break
+                        # O(1) 查 class 映射，替代原来的 O(n) full AST walk
+                        class_name = class_map.get(func_start)
 
                         results.append({
                             "file": file_info["file"],
@@ -466,7 +477,7 @@ def detect_dynamic_risks(project_root: Path) -> List[Dict]:
                             "file": file_str,
                             "line": i,
                             "pattern": pattern,
-                            "message": f"{message} — {line.strip()[:80]}"
+                            "message": f"{message} - {line.strip()[:80]}"
                         })
 
     return risks
@@ -518,16 +529,14 @@ def main():
         sys.exit(1)
 
     if not (project_root / ".git").is_dir():
-        print(json.dumps({
-            "error": (
-                f"'{project_root}' 不是 git 仓库。\n"
-                "Test Shield 需要 git diff 来分析代码改动。\n"
-                "请在 git 仓库中运行：\n"
-                "  cd your-python-project\n"
-                "  python path/to/analyze.py ."
-            ),
-            "stats": _empty_stats()
-        }, indent=2, ensure_ascii=False))
+        print(
+            f"Error: '{project_root}' 不是 git 仓库。\n"
+            "Test Shield 需要 git diff 来分析代码改动。\n"
+            "请在 git 仓库中运行：\n"
+            "  cd your-python-project\n"
+            "  python path/to/analyze.py .",
+            file=sys.stderr
+        )
         sys.exit(1)
 
     diff_text = run_git_diff(project_root)
@@ -560,7 +569,7 @@ def main():
             )
             for c in high_risk_untested[:5]:
                 print(
-                    f"  {c['caller_name']}() — "
+                    f"  {c['caller_name']}() - "
                     f"{c['caller_file']}:{c['caller_line']}",
                     file=sys.stderr
                 )
@@ -637,11 +646,11 @@ def _print_summary(output: dict) -> None:
             test_status = "[有测试]" if c["has_tests"] else "[无测试]"
             print(
                 f"    {icon} {c['caller_name']}()"
-                f" — {c['caller_file']}:{c['caller_line']}"
+                f" - {c['caller_file']}:{c['caller_line']}"
                 f"  {test_status}"
             )
     else:
-        print("    (无间接影响 — 这个改动没有下游调用方)")
+        print("    (无间接影响 - 这个改动没有下游调用方)")
 
     print(f"\n  高风险且无测试: {s['high_risk_untested_count']} 个"
           f"{' ← 提交前建议生成回归测试' if s['high_risk_untested_count'] else ''}")
@@ -651,7 +660,7 @@ def _print_summary(output: dict) -> None:
     print(f"  动态风险: {hr['dynamic_risks_detected']} 处")
     if hr['dynamic_risks_detected'] > 0:
         for dr in output["dynamic_risks"]:
-            print(f"    ! {dr['file']}:{dr['line']} — {dr['pattern']}")
+            print(f"    ! {dr['file']}:{dr['line']} - {dr['pattern']}")
     print(f"  已知盲点: {', '.join(hr['known_blind_spots'][:2])}...")
     print()
 
@@ -686,7 +695,7 @@ python "{analyze_path}" . --pre-commit
             print(f"  位置: {hook_path}")
             return
         # 备份原 hook，追加 Test Shield
-        backup_path = hook_path.with_suffix(".pre-commit.backup")
+        backup_path = hook_path.with_name(hook_path.name + ".backup")
         hook_path.rename(backup_path)
         hook_content = (
             f"#!/bin/bash\n"
@@ -723,14 +732,12 @@ def _empty_stats() -> dict:
 
 
 def _print_usage() -> None:
-    print(json.dumps({
-        "error": "Usage: python analyze.py <project_root>",
-        "stats": _empty_stats()
-    }, indent=2, ensure_ascii=False))
+    print("Usage: python analyze.py <project_root>", file=sys.stderr)
+    print("       python analyze.py --help", file=sys.stderr)
 
 
 def _print_help() -> None:
-    print(f"""test-shield v{__version__} — AST 调用链追踪脚本
+    print(f"""test-shield v{__version__} - AST 调用链追踪脚本
 
 用法:
     python analyze.py <project_root>              完整分析（全量 AST 扫描）
