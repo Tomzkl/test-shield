@@ -195,12 +195,21 @@ $ /test-shield
 
 ## Roadmap
 
-| Version | What |
-|---------|------|
-| v1.0 | Python + pytest, AST tracing, /test-shield command, test caching |
-| v1.1 | Coverage verification (run pytest-cov after generation) |
-| v1.2 | TypeScript / Jest support |
-| v2.0 | CI/CD integration, git hook auto-trigger |
+```
+v1.0  ✅ Python + pytest · AST 追踪 · /test-shield · 测试缓存 · pre-commit · 增量分析
+v1.5  🎯 VS Code 扩展 · GitHub PR Comment bot · Slack/飞书通知 · pre-commit hook
+v2.0  🌍 多语言：TypeScript/Jest → Go → Rust
+v2.5  📊 风险评分 (0-100) · 历史分析 · 行为 Diff
+v3.0  🔗 跨仓库追踪 · 团队风险热力图 · 匿名风险模式数据库
+```
+
+| Version | What | Status |
+|---------|------|--------|
+| v1.0 | Python + pytest, AST tracing, /test-shield, test caching, `--pre-commit`, `--incremental` | ✅ Done |
+| v1.5 | VS Code extension, GitHub PR comment bot, Slack/飞书/钉钉通知 | 🎯 Next |
+| v2.0 | TypeScript/Jest → Go → Rust multi-language support | 🌍 Planned |
+| v2.5 | Risk scoring (0-100), git history bug analysis, behavioral diff | 📊 Planned |
+| v3.0 | Cross-repo tracing, team risk heatmap, anonymous risk pattern DB | 🔗 Vision |
 
 ---
 

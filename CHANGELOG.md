@@ -14,6 +14,8 @@
 - `scripts/analyze.py`：AST 调用链追踪脚本，零依赖，纯 Python stdlib
 - 交互式确认流程：对每条受影响路径，用户选择 A) 保持行为 / B) 跟随变更 / C) 跳过
 - 诚实声明：每次运行报告追踪方式、检测到的动态风险、已知盲点
+- **`--pre-commit` 模式**：高风险 + 无测试调用方 → exit 1 阻止提交，否则 exit 0 静默放行
+- **`--incremental` 增量分析**：git grep 预筛选，1000 文件项目只改了 1 个函数时仅解析 5-20 个相关文件
 - `--version` / `--help` CLI 标志
 - 测试缓存优化：测试目录扫描一次，缓存复用（O(n*m) → O(n)）
 - 行号→函数映射优化：预构建 map，O(1) 查表替代每次 O(n) 遍历
@@ -24,20 +26,19 @@
 
 ### 文档 (Docs)
 
-- README.md：项目入口、快速开始、示例、已知限制、FAQ 速查表
+- README.md：项目入口、快速开始、示例、已知限制、FAQ 速查表、路线图
 - SKILL.md：Claude Code 完整七步工作流
 - CONTRIBUTING.md：贡献指南 + analyze.py 架构说明
 - docs/faq.md：12 个高频问题
 - examples/demo.md：三个完整场景演示
 - examples/devto-article.md：项目故事和背景
 
-### 限制 (Known Limitations — v1.0)
+### 路线图 (Roadmap)
 
-- Python + pytest 专属（TypeScript/Jest → v1.2）
-- 无法追踪动态调用（getattr/importlib/猴子补丁/装饰器注入）
-- 不自动修测试、不自动 commit
-- 无 CI/CD 集成（→ v2.0）
-- 静态分析仅限 AST 能解析的代码路径
+- v1.5 🎯 VS Code 扩展 · GitHub PR Comment bot · Slack/飞书通知
+- v2.0 🌍 多语言：TypeScript/Jest → Go → Rust
+- v2.5 📊 风险评分 (0-100) · git 历史分析 · 行为 Diff
+- v3.0 🔗 跨仓库追踪 · 团队风险热力图 · 匿名风险模式数据库
 
 ---
 

@@ -323,13 +323,26 @@ def build_import_alias_map(tree: ast.AST) -> Dict[str, str]:
 
 
 def build_call_graph(
-    project_root: Path, changed_functions: List[Dict]
+    project_root: Path, changed_functions: List[Dict], incremental: bool = False
 ) -> List[Dict]:
-    """构建调用图：找到所有调用改动函数的代码位置。"""
+    """构建调用图：找到所有调用改动函数的代码位置。
+
+    如果 incremental=True，先用 grep 筛选可能受影响的文件，再 AST 解析——
+    1000 文件的项目如果只改了 1 个函数，可能只解析 5-20 个文件而非全部。
+    """
     affected = []
     test_cache = build_test_cache(project_root)
 
-    for py_file in project_root.rglob("*.py"):
+    # 增量模式：用 git grep 预筛选
+    if incremental and changed_functions:
+        py_files = _find_relevant_files(project_root, changed_functions)
+    else:
+        py_files = list(project_root.rglob("*.py"))
+
+    for py_file in py_files:
+        # 确保路径是 Path 对象
+        if not isinstance(py_file, Path):
+            py_file = Path(py_file)
         file_str = str(py_file.relative_to(project_root)).replace("\\", "/")
 
         if any(skip in py_file.parts for skip in SKIP_DIRS):
@@ -364,7 +377,7 @@ def build_call_graph(
                 if resolved_name != changed["name"]:
                     continue
 
-                # O(1) 行号→函数查表（替代原来的 O(n) find_enclosing_function）
+                # O(1) 行号→函数查表
                 caller_func = line_to_func.get(node.lineno)
                 if caller_func:
                     caller_name_str = caller_func.name
@@ -373,7 +386,7 @@ def build_call_graph(
 
                 risk = "low" if is_low_risk(caller_name_str, file_str) else "high"
 
-                # O(1) 缓存查表（替代原来的 O(n) check_has_tests）
+                # O(1) 缓存查表
                 has_tests = check_has_tests(test_cache, caller_name_str)
 
                 affected.append({
@@ -387,6 +400,40 @@ def build_call_graph(
                 })
 
     return affected
+
+
+def _find_relevant_files(project_root: Path, changed_functions: List[Dict]) -> List[Path]:
+    """增量分析：找到引用改动函数的 Python 文件 + 改动文件本身。
+
+    用 git grep 做快速文本搜索，只返回可能受影响的文件。
+    对大型项目（1000+ .py 文件）可将 AST 解析量从全量降到 5-20 个文件。
+    """
+    candidate_paths: Set[Path] = set()
+
+    # 始终包含改动文件本身
+    for cf in changed_functions:
+        fpath = project_root / cf["file"]
+        if fpath.exists():
+            candidate_paths.add(fpath)
+
+    # 用 git grep 搜索每个改动函数名
+    function_names = set(cf["name"] for cf in changed_functions)
+    for fname in function_names:
+        try:
+            result = subprocess.run(
+                ["git", "grep", "-l", "-F", fname, "--", "*.py"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=project_root
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().split("\n"):
+                    fpath = project_root / line.strip()
+                    if fpath.exists():
+                        candidate_paths.add(fpath)
+        except Exception:
+            pass
+
+    return list(candidate_paths)
 
 
 DYNAMIC_PATTERNS = {
@@ -451,22 +498,49 @@ def main():
         print(f"""test-shield v{__version__} — AST 调用链追踪脚本
 
 用法:
-    python analyze.py <project_root>    分析 git diff，输出受影响的调用方 JSON
-    python analyze.py --version         显示版本号
-    python analyze.py --help            显示此帮助
+    python analyze.py <project_root>              完整分析（全量 AST 扫描）
+    python analyze.py <project_root> --pre-commit  pre-commit 检查模式
+    python analyze.py <project_root> --incremental 增量分析（仅解析相关文件）
+    python analyze.py --version                   显示版本号
+    python analyze.py --help                      显示此帮助
 
 示例:
     cd ~/my-python-project
     python ~/.claude/skills/test-shield/scripts/analyze.py .
+    python ~/.claude/skills/test-shield/scripts/analyze.py . --pre-commit
 
-输出:
-    JSON → {{changed_functions, affected_callers, dynamic_risks, stats}}
+pre-commit 模式:
+    如果存在高风险 + 无测试保护的调用方 → exit 1，阻止提交
+    否则 exit 0，静默放行
+    用法：放到 .git/hooks/pre-commit 里
+
+增量模式:
+    先用 git grep 定位引用改动函数的 .py 文件，仅 AST 解析这些文件
+    1000 文件项目只改 1 个函数 → 解析 5-20 个文件而非 1000 个
 
 零依赖。纯 Python stdlib (ast + json + subprocess)。Python 3.10+。
 """)
         sys.exit(0)
 
-    project_root = Path(sys.argv[1]).resolve()
+    # 解析参数
+    args = sys.argv[1:]
+    pre_commit_mode = "--pre-commit" in args
+    incremental_mode = "--incremental" in args
+
+    # 第一个非 flag 参数是项目路径
+    project_path = None
+    for arg in args:
+        if not arg.startswith("-"):
+            project_path = arg
+            break
+
+    if project_path is None:
+        print(json.dumps({
+            "error": "请指定项目路径。用法: python analyze.py <project_root>",
+        }, indent=2, ensure_ascii=False))
+        sys.exit(1)
+
+    project_root = Path(project_path).resolve()
     if not project_root.is_dir():
         print(json.dumps({
             "error": f"Not a directory: {project_root}",
@@ -487,7 +561,9 @@ def main():
     diff_text = run_git_diff(project_root)
     changed_files = parse_diff_files(diff_text)
     changed_functions = find_changed_functions(project_root, changed_files)
-    affected_callers = build_call_graph(project_root, changed_functions)
+    affected_callers = build_call_graph(
+        project_root, changed_functions, incremental=incremental_mode
+    )
     dynamic_risks = detect_dynamic_risks(project_root)
 
     seen = set()
@@ -500,6 +576,43 @@ def main():
 
     high_risk = [c for c in unique_callers if c["risk"] == "high"]
     low_risk = [c for c in unique_callers if c["risk"] == "low"]
+    high_risk_untested = [c for c in high_risk if not c["has_tests"]]
+
+    # --pre-commit 模式：检查高风险无测试调用方
+    if pre_commit_mode:
+        if high_risk_untested:
+            print(
+                f"⛔ 提交被阻止：你的改动影响了 {len(high_risk_untested)} 个"
+                f"高风险调用方，它们没有测试保护。\n",
+                file=sys.stderr
+            )
+            for c in high_risk_untested[:5]:
+                print(
+                    f"  {c['caller_name']}() — "
+                    f"{c['caller_file']}:{c['caller_line']}",
+                    file=sys.stderr
+                )
+            if len(high_risk_untested) > 5:
+                print(
+                    f"  ... 另外 {len(high_risk_untested) - 5} 个调用方",
+                    file=sys.stderr
+                )
+            print(
+                f"\n  跳过检查：git commit --no-verify",
+                file=sys.stderr
+            )
+            print(
+                f"  生成回归测试：运行 /test-shield",
+                file=sys.stderr
+            )
+            print(
+                f"  查看详情：python analyze.py .",
+                file=sys.stderr
+            )
+            sys.exit(1)
+        else:
+            # 静默退出 — 所有安全
+            sys.exit(0)
 
     output = {
         "changed_functions": changed_functions,
@@ -511,6 +624,7 @@ def main():
             "total_affected_callers": len(unique_callers),
             "high_risk_count": len(high_risk),
             "low_risk_count": len(low_risk),
+            "high_risk_untested_count": len(high_risk_untested),
             "dynamic_risk_count": len(dynamic_risks)
         }
     }
